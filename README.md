@@ -1,6 +1,6 @@
 # BusManagerV1
 
-Short description of what this project is and does.
+Develop an app to assist with the automation of running Take A Bus To Afrikaburn - Ticket sales, records, reselling etc.
 
 ## Getting Started
 
