@@ -18,3 +18,5 @@
 
 # prisma
 /prisma/dev.db
+.env.*
+!.env.example
