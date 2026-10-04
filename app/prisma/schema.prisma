@@ -1,0 +1,223 @@
+// BusManagerV1 — core schema
+//
+// Reflects the domain model worked out from historical order data,
+// the Parkers Bus Services contract, and real passenger manifests:
+//
+//   Season
+//    -> Departure (a named, scheduled bus run: WAP / Early / Mid / Late,
+//       in a direction, with a fixed capacity)
+//    -> Order (one purchase: one customer, one payment)
+//        -> Passenger (a named rider on that order)
+//            -> LegBooking (one passenger, on one Departure — the
+//               actual bookable seat. A round-trip passenger gets two:
+//               one inbound, one outbound.)
+//
+// Round-trip products are not "any IN + any OUT" — only certain
+// return days are valid per departure. That's modelled via
+// RoundTripOption below rather than left as free-form booking.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Direction {
+  INTO_THE_DUST // Cape Town -> AfrikaBurn
+  OUT_OF_THE_DUST // AfrikaBurn -> Cape Town
+}
+
+enum TicketKind {
+  ONE_WAY
+  ROUND_TRIP
+}
+
+enum PaymentStatus {
+  UNPAID
+  PAID
+  REFUNDED // kept for completeness; business rule today is "no refunds"
+}
+
+enum TransferStatus {
+  NONE
+  REQUESTED
+  APPROVED
+  COMPLETED
+  DECLINED
+}
+
+// One AfrikaBurn event year. Pricing, route, pickup point and
+// departures are all season-scoped because they change every year
+// (e.g. Green Point Stadium -> Pinelands Oval, R1,100 -> R1,300).
+model Season {
+  id                String   @id @default(cuid())
+  year              Int      @unique
+  eventTheme        String? // e.g. "Through The Prism" (2026)
+  pickupLocation    String // e.g. "Pinelands Oval"
+  pickupLocationGps String?
+  ticketChangeCutoff DateTime? // e.g. 20 April — last day for the one allowed date change
+  oneWayPriceCents  Int // store money as integer cents to avoid float issues
+  roundTripPriceCents Int
+
+  departures Departure[]
+  orders     Order[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// A bus company contracted for one or more departures in a season.
+model Supplier {
+  id    String @id @default(cuid())
+  name  String // "Parkers Bus Services", "LA Tours"
+  phone String?
+  email String?
+
+  departures Departure[]
+}
+
+// A single named, scheduled bus run — e.g. "MID Express, Wed 29 Apr,
+// Into the Dust". This is the thing capacity is actually tracked
+// against.
+model Departure {
+  id         String    @id @default(cuid())
+  season     Season    @relation(fields: [seasonId], references: [id])
+  seasonId   String
+  supplier   Supplier? @relation(fields: [supplierId], references: [id])
+  supplierId String?
+
+  code      String // "WAP" | "EARLY" | "MID" | "LATE" | "RETURN_SUN" | "RETURN_MON" etc.
+  label     String // human-readable, e.g. "MID Express"
+  direction Direction
+  departsAt DateTime
+  arrivesAt DateTime?
+
+  // Restricted departures (e.g. WAP = Work Access Pass holders only)
+  restricted       Boolean @default(false)
+  restrictionNotes String?
+
+  seatCapacity Int // e.g. 55 per 60-seater bus x number of buses
+
+  legBookings      LegBooking[]
+  roundTripOptionsAsInbound  RoundTripOption[] @relation("InboundDeparture")
+  roundTripOptionsAsOutbound RoundTripOption[] @relation("OutboundDeparture")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([seasonId, code])
+}
+
+// Encodes which Inbound+Outbound Departure pairs are actually valid
+// round-trip combinations for a season, e.g.:
+//   EARLY (Mon)  -> Wed / Fri / Sun returns
+//   MID   (Wed)  -> Fri / Sun returns
+//   LATE  (Fri)  -> Sun return only
+// This is what the booking flow should validate against instead of
+// allowing any inbound+outbound combination.
+model RoundTripOption {
+  id        String    @id @default(cuid())
+  inbound   Departure @relation("InboundDeparture", fields: [inboundId], references: [id])
+  inboundId String
+  outbound  Departure @relation("OutboundDeparture", fields: [outboundId], references: [id])
+  outboundId String
+
+  @@unique([inboundId, outboundId])
+}
+
+model Customer {
+  id    String  @id @default(cuid())
+  email String  @unique
+  name  String?
+  phone String?
+
+  orders Order[]
+
+  createdAt DateTime @default(now())
+}
+
+// One purchase. Can contain multiple Passengers (e.g. a couple
+// booking together), and payment is tracked at the Order level.
+model Order {
+  id         String        @id @default(cuid())
+  season     Season        @relation(fields: [seasonId], references: [id])
+  seasonId   String
+  customer   Customer      @relation(fields: [customerId], references: [id])
+  customerId String
+
+  paymentStatus PaymentStatus @default(UNPAID)
+  totalCents    Int
+  placedAt      DateTime      @default(now())
+  paidAt        DateTime?
+
+  // Payment processor reference (e.g. Peach checkout/transaction id)
+  providerName String? // which PaymentProvider handled this
+  providerRef  String?
+
+  passengers Passenger[]
+  donations  Donation[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// A named rider on an Order. Note: different passengers on the same
+// order can have different itineraries (confirmed from real data).
+model Passenger {
+  id       String  @id @default(cuid())
+  order    Order   @relation(fields: [orderId], references: [id])
+  orderId  String
+  name     String
+  surname  String
+  playaName String? // on-site / "Super Hero" nickname
+  email    String?
+  phone    String?
+  notes    String? // e.g. travel-sickness seating request
+
+  legBookings LegBooking[]
+
+  createdAt DateTime @default(now())
+}
+
+// The actual bookable unit: one passenger, on one departure, in one
+// direction. A one-way passenger has exactly one of these; a
+// round-trip passenger has exactly two (inbound + outbound).
+model LegBooking {
+  id          String     @id @default(cuid())
+  passenger   Passenger  @relation(fields: [passengerId], references: [id])
+  passengerId String
+  departure   Departure  @relation(fields: [departureId], references: [id])
+  departureId String
+
+  ticketKind TicketKind // ONE_WAY | ROUND_TRIP (which product this leg belongs to)
+
+  // Operational state, confirmed from real manifests:
+  ticketSent Boolean @default(false)
+  present    Boolean @default(false) // day-of boarding check-in
+
+  // Business rule: exactly one date change allowed, before the
+  // season's ticketChangeCutoff.
+  dateChangesUsed Int @default(0)
+
+  transferStatus TransferStatus @default(NONE)
+  transferredToName String? // kept simple for V1; could become its own model later
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([departureId])
+}
+
+// Optional, can attach to an order or stand alone — confirmed from
+// the "Nookie Love Boost" campaign copy.
+model Donation {
+  id        String   @id @default(cuid())
+  order     Order?   @relation(fields: [orderId], references: [id])
+  orderId   String?
+  amountCents Int
+  donorEmail String?
+  createdAt DateTime @default(now())
+}
