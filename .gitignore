@@ -17,3 +17,7 @@ data/processed/*
 
 # Logs
 *.log
+
+# raw exports contain personal data
+data/raw/*
+!data/raw/**/.gitkeep
