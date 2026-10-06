@@ -152,6 +152,7 @@ model Order {
   totalCents    Int
   placedAt      DateTime      @default(now())
   paidAt        DateTime?
+  expiresAt DateTime?
 
   // Payment processor reference (e.g. Peach checkout/transaction id)
   providerName String? // which PaymentProvider handled this

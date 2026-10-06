@@ -21,3 +21,6 @@ data/processed/*
 # raw exports contain personal data
 data/raw/*
 !data/raw/**/.gitkeep
+.env
+node_modules/
+.next/

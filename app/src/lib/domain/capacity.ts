@@ -1,18 +1,14 @@
 import { prisma } from "@/lib/db";
+import { countTakenSeats } from "./seats";
 
-// How many seats are currently booked (paid LegBookings) on a
-// departure, vs how many remain.
+// How many seats are currently taken on a departure (paid, or held
+// by an unpaid order that has not expired), vs how many remain.
 export async function getDepartureCapacity(departureId: string) {
   const departure = await prisma.departure.findUniqueOrThrow({
     where: { id: departureId },
-    include: {
-      legBookings: {
-        where: { passenger: { order: { paymentStatus: "PAID" } } },
-      },
-    },
   });
 
-  const booked = departure.legBookings.length;
+  const booked = await countTakenSeats(departureId);
   return {
     departureId,
     seatCapacity: departure.seatCapacity,
