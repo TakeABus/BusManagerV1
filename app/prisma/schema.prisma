@@ -1,20 +1,17 @@
-// BusManagerV1 — core schema
-//
-// Reflects the domain model worked out from historical order data,
-// the Parkers Bus Services contract, and real passenger manifests:
+// BusManagerV1 — core schema (v2 proposal)
 //
 //   Season
-//    -> Departure (a named, scheduled bus run: WAP / Early / Mid / Late,
-//       in a direction, with a fixed capacity)
-//    -> Order (one purchase: one customer, one payment)
-//        -> Passenger (a named rider on that order)
-//            -> LegBooking (one passenger, on one Departure — the
-//               actual bookable seat. A round-trip passenger gets two:
-//               one inbound, one outbound.)
+//    -> Departure (named, scheduled bus run, direction, capacity, cost)
+//    -> Order (one purchase; may hold many tickets)
+//        -> Ticket (the thing that is sold, named, resold, hashed)
+//            -> LegBooking (the actual seat on one Departure;
+//               ONE_WAY / RETURN_ONLY = 1 leg, ROUND_TRIP = 2 legs)
 //
-// Round-trip products are not "any IN + any OUT" — only certain
-// return days are valid per departure. That's modelled via
-// RoundTripOption below rather than left as free-form booking.
+// Rules baked into this model (see DECISIONS.md):
+//  - Resale and the QR hash apply to the WHOLE ticket, never one leg.
+//  - 1 free name change + 1 resale per ticket. Resold tickets cannot be resold again.
+//  - No refunds, no partial payments, fixed price for everyone.
+//  - Seats are only reserved once payment clears (or a time-limited hold).
 
 generator client {
   provider = "prisma-client-js"
@@ -31,57 +28,115 @@ enum Direction {
 }
 
 enum TicketKind {
-  ONE_WAY
-  ROUND_TRIP
+  ONE_WAY // single ticket up
+  ROUND_TRIP // up + a valid return day
+  RETURN_ONLY // single ticket down, for riders with their own way up
 }
 
+// NOTE: REFUNDED removed on purpose — business rule is "no refunds".
 enum PaymentStatus {
-  UNPAID
+  PENDING
   PAID
-  REFUNDED // kept for completeness; business rule today is "no refunds"
+  FAILED
+  EXPIRED
 }
 
-enum TransferStatus {
-  NONE
-  REQUESTED
-  APPROVED
-  COMPLETED
-  DECLINED
+enum TicketSource {
+  PURCHASED // paid through the app
+  DIRECT_PAYMENT // paid the organisers directly (cash / EFT), recorded by admin
+  COMP // free ticket
 }
 
-// One AfrikaBurn event year. Pricing, route, pickup point and
-// departures are all season-scoped because they change every year
-// (e.g. Green Point Stadium -> Pinelands Oval, R1,100 -> R1,300).
+enum TicketStatus {
+  PENDING_PAYMENT // seat held until the payment window expires
+  ACTIVE
+  LISTED_FOR_RESALE
+  EXPIRED // payment window lapsed, seat released
+}
+
+enum ResaleStatus {
+  LISTED
+  PENDING_PAYMENT // buyer started checkout
+  SOLD
+  WITHDRAWN
+  CLOSED // passed the resale cutoff unsold; ticket stays with seller
+}
+
+enum DepartureStatus {
+  PLANNED
+  CONFIRMED
+  CANCELLED
+}
+
+enum VehicleType {
+  BUS_60 // 60-seater, 55 sellable
+  VAN_12 // 12-seater, 10 sellable
+}
+
+enum CostCategory {
+  VEHICLE // paid to Parkers / LA Tours for a departure
+  DEAD_LEG // contractual empty return (WAP)
+  PAYMENT_FEES
+  MARKETING
+  HOSTING
+  SECURITY
+  OTHER
+}
+
+enum TicketEventType {
+  CREATED
+  PAID
+  NAME_CHANGED
+  DATE_CHANGED
+  RESALE_LISTED
+  RESALE_WITHDRAWN
+  RESOLD
+  COMP_GRANTED
+  HASH_REISSUED
+  CHECKED_IN
+  ADMIN_NOTE
+}
+
 model Season {
-  id                String   @id @default(cuid())
-  year              Int      @unique
-  eventTheme        String? // e.g. "Through The Prism" (2026)
-  pickupLocation    String // e.g. "Pinelands Oval"
-  pickupLocationGps String?
-  ticketChangeCutoff DateTime? // e.g. 20 April — last day for the one allowed date change
-  oneWayPriceCents  Int // store money as integer cents to avoid float issues
-  roundTripPriceCents Int
+  id                 String    @id @default(cuid())
+  year               Int       @unique
+  eventTheme         String?
+  pickupLocation     String // e.g. "Pinelands Oval"
+  pickupLocationGps  String?
+  ticketChangeCutoff DateTime? // last day for the one allowed date change (e.g. 20 April)
+
+  // Fixed prices, stored as integer cents. Same price for everyone, no early-bird.
+  // Optional until the season's prices are decided; the order code must refuse
+  // to sell a ticket kind whose price is null, or any order before salesOpensAt.
+  oneWayPriceCents     Int?
+  roundTripPriceCents  Int?
+  returnOnlyPriceCents Int?
+  salesOpensAt         DateTime? // e.g. 15 Feb 2027; null = sales not open yet
+
+  // Resale rules live in data, not code, so they can change per season.
+  resaleFloorPercent Int @default(50) // minimum listing price as % of original price
+  resaleFeePercent   Int @default(8) // taken from the seller's side
+  resaleCutoffHours  Int @default(48) // resale closes this long before the first departure
+  paymentHoldMinutes Int @default(1440) // 24h to pay before the seat is released
 
   departures Departure[]
   orders     Order[]
+  costItems  CostItem[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
 
-// A bus company contracted for one or more departures in a season.
 model Supplier {
-  id    String @id @default(cuid())
+  id    String  @id @default(cuid())
   name  String // "Parkers Bus Services", "LA Tours"
   phone String?
   email String?
 
   departures Departure[]
+  costItems  CostItem[]
 }
 
-// A single named, scheduled bus run — e.g. "MID Express, Wed 29 Apr,
-// Into the Dust". This is the thing capacity is actually tracked
-// against.
 model Departure {
   id         String    @id @default(cuid())
   season     Season    @relation(fields: [seasonId], references: [id])
@@ -90,20 +145,31 @@ model Departure {
   supplierId String?
 
   code      String // "WAP" | "EARLY" | "MID" | "LATE" | "RETURN_SUN" | "RETURN_MON" etc.
-  label     String // human-readable, e.g. "MID Express"
+  label     String
   direction Direction
   departsAt DateTime
   arrivesAt DateTime?
 
-  // Restricted departures (e.g. WAP = Work Access Pass holders only)
-  restricted       Boolean @default(false)
+  restricted       Boolean @default(false) // e.g. WAP holders only
   restrictionNotes String?
 
-  seatCapacity Int // e.g. 55 per 60-seater bus x number of buses
+  // Vehicles committed for this departure. seatCapacity = sellable seats in total.
+  vehicleType  VehicleType @default(BUS_60)
+  vehicleCount Int         @default(1)
+  seatCapacity Int
 
-  legBookings      LegBooking[]
+  // Conditional trips (mainly Wednesday). Status "at risk" is computed in code
+  // from minPassengers + decideBy; only the decided states are stored.
+  status        DepartureStatus @default(PLANNED)
+  conditional   Boolean         @default(false)
+  minPassengers Int? // break-even passenger count that justifies running
+  decideBy      DateTime? // last sensible moment to cancel
+  isDeadLeg     Boolean         @default(false) // empty return, contractual cost
+
+  legBookings                LegBooking[]
   roundTripOptionsAsInbound  RoundTripOption[] @relation("InboundDeparture")
   roundTripOptionsAsOutbound RoundTripOption[] @relation("OutboundDeparture")
+  costItems                  CostItem[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -111,18 +177,11 @@ model Departure {
   @@unique([seasonId, code])
 }
 
-// Encodes which Inbound+Outbound Departure pairs are actually valid
-// round-trip combinations for a season, e.g.:
-//   EARLY (Mon)  -> Wed / Fri / Sun returns
-//   MID   (Wed)  -> Fri / Sun returns
-//   LATE  (Fri)  -> Sun return only
-// This is what the booking flow should validate against instead of
-// allowing any inbound+outbound combination.
 model RoundTripOption {
-  id        String    @id @default(cuid())
-  inbound   Departure @relation("InboundDeparture", fields: [inboundId], references: [id])
-  inboundId String
-  outbound  Departure @relation("OutboundDeparture", fields: [outboundId], references: [id])
+  id         String    @id @default(cuid())
+  inbound    Departure @relation("InboundDeparture", fields: [inboundId], references: [id])
+  inboundId  String
+  outbound   Departure @relation("OutboundDeparture", fields: [outboundId], references: [id])
   outboundId String
 
   @@unique([inboundId, outboundId])
@@ -139,86 +198,224 @@ model Customer {
   createdAt DateTime @default(now())
 }
 
-// One purchase. Can contain multiple Passengers (e.g. a couple
-// booking together), and payment is tracked at the Order level.
 model Order {
-  id         String        @id @default(cuid())
-  season     Season        @relation(fields: [seasonId], references: [id])
-  seasonId   String
-  customer   Customer      @relation(fields: [customerId], references: [id])
-  customerId String
+  id          String   @id @default(cuid())
+  orderNumber Int      @unique @default(autoincrement()) // short human-friendly number for support
+  season      Season   @relation(fields: [seasonId], references: [id])
+  seasonId    String
+  customer    Customer @relation(fields: [customerId], references: [id])
+  customerId  String
 
-  paymentStatus PaymentStatus @default(UNPAID)
-  totalCents    Int
-  placedAt      DateTime      @default(now())
-  paidAt        DateTime?
-  expiresAt DateTime?
+  // Old Shopstar orders keep their original number here (e.g. 398xxx).
+  externalSource String? // "shopstar"
+  externalRef    String?
 
-  // Payment processor reference (e.g. Peach checkout/transaction id)
-  providerName String? // which PaymentProvider handled this
-  providerRef  String?
+  totalCents Int
+  placedAt   DateTime @default(now())
 
-  passengers Passenger[]
-  donations  Donation[]
+  tickets   Ticket[]
+  payments  Payment[]
+  donations Donation[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  @@unique([externalSource, externalRef])
 }
 
-// A named rider on an Order. Note: different passengers on the same
-// order can have different itineraries (confirmed from real data).
+// A named person. On resale the buyer becomes a new Passenger and the
+// ticket's holder is switched to them; the old record is kept for history.
 model Passenger {
-  id       String  @id @default(cuid())
-  order    Order   @relation(fields: [orderId], references: [id])
-  orderId  String
-  name     String
-  surname  String
-  playaName String? // on-site / "Super Hero" nickname
-  email    String?
-  phone    String?
-  notes    String? // e.g. travel-sickness seating request
+  id        String  @id @default(cuid())
+  name      String
+  surname   String
+  playaName String?
+  email     String?
+  phone     String?
+  notes     String?
 
-  legBookings LegBooking[]
+  heldTickets     Ticket[]
+  resalesAsSeller Resale[] @relation("ResaleSeller")
+  resalesAsBuyer  Resale[] @relation("ResaleBuyer")
 
   createdAt DateTime @default(now())
 }
 
-// The actual bookable unit: one passenger, on one departure, in one
-// direction. A one-way passenger has exactly one of these; a
-// round-trip passenger has exactly two (inbound + outbound).
+// The unit that is sold, named, resold and hashed.
+model Ticket {
+  id      String @id @default(cuid())
+  order   Order  @relation(fields: [orderId], references: [id])
+  orderId String
+
+  holder   Passenger @relation(fields: [holderId], references: [id])
+  holderId String
+
+  kind       TicketKind
+  source     TicketSource @default(PURCHASED)
+  sourceNote String? // e.g. why it is a comp, who took the cash
+  status     TicketStatus @default(PENDING_PAYMENT)
+
+  priceCents    Int // price actually paid (0 for comps); basis for the resale floor
+  holdExpiresAt DateTime? // seat hold while PENDING_PAYMENT
+
+  // Per-ticket allowances.
+  nameChangesUsed Int     @default(0) // max 1 free direct name change
+  dateChangesUsed Int     @default(0) // max 1, before Season.ticketChangeCutoff
+  resold          Boolean @default(false) // true once resold; cannot be resold again
+
+  // QR/ticket identity. qrHash = SHA256(ticketId + hashVersion + server secret).
+  // hashVersion is bumped on resale or name change so old QR codes stop working.
+  qrHash      String  @unique
+  hashVersion Int     @default(1)
+  ticketSent  Boolean @default(false)
+
+  payment   Payment? @relation(fields: [paymentId], references: [id])
+  paymentId String?
+
+  legs    LegBooking[]
+  resales Resale[]
+  events  TicketEvent[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([orderId])
+  @@index([holderId])
+}
+
+// The bookable seat. Capacity is counted over legs whose ticket is
+// ACTIVE, LISTED_FOR_RESALE, or PENDING_PAYMENT with an unexpired hold.
 model LegBooking {
-  id          String     @id @default(cuid())
-  passenger   Passenger  @relation(fields: [passengerId], references: [id])
-  passengerId String
-  departure   Departure  @relation(fields: [departureId], references: [id])
+  id          String    @id @default(cuid())
+  ticket      Ticket    @relation(fields: [ticketId], references: [id])
+  ticketId    String
+  departure   Departure @relation(fields: [departureId], references: [id])
   departureId String
 
-  ticketKind TicketKind // ONE_WAY | ROUND_TRIP (which product this leg belongs to)
-
-  // Operational state, confirmed from real manifests:
-  ticketSent Boolean @default(false)
-  present    Boolean @default(false) // day-of boarding check-in
-
-  // Business rule: exactly one date change allowed, before the
-  // season's ticketChangeCutoff.
-  dateChangesUsed Int @default(0)
-
-  transferStatus TransferStatus @default(NONE)
-  transferredToName String? // kept simple for V1; could become its own model later
+  present Boolean @default(false) // day-of boarding check-in
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  @@unique([ticketId, departureId])
   @@index([departureId])
 }
 
-// Optional, can attach to an order or stand alone — confirmed from
-// the "Nookie Love Boost" campaign copy.
-model Donation {
-  id        String   @id @default(cuid())
-  order     Order?   @relation(fields: [orderId], references: [id])
-  orderId   String?
+// One resale of a whole ticket. The seller sets a price >= floor; the fee
+// comes out of the seller's side and the buyer pays the listed price.
+model Resale {
+  id       String @id @default(cuid())
+  ticket   Ticket @relation(fields: [ticketId], references: [id])
+  ticketId String
+
+  seller   Passenger  @relation("ResaleSeller", fields: [sellerId], references: [id])
+  sellerId String
+  buyer    Passenger? @relation("ResaleBuyer", fields: [buyerId], references: [id])
+  buyerId  String?
+
+  listedPriceCents Int
+  floorPriceCents  Int // snapshot of the floor when listed
+  feePercent       Int // snapshot of the fee rule when listed
+  feeCents         Int
+  sellerNetCents   Int
+
+  status   ResaleStatus @default(LISTED)
+  listedAt DateTime     @default(now())
+  closesAt DateTime // Season.resaleCutoffHours before the first departure
+  soldAt   DateTime?
+
+  buyerPayment   Payment? @relation(fields: [buyerPaymentId], references: [id])
+  buyerPaymentId String?  @unique
+
+  @@index([ticketId])
+  @@index([status])
+}
+
+// One checkout attempt with a payment provider. A normal checkout pays for
+// every ticket on an order; in a bulk order each rider's link is its own
+// Payment covering a single ticket. Resale purchases also use a Payment
+// (then orderId is empty).
+model Payment {
+  id      String  @id @default(cuid())
+  order   Order?  @relation(fields: [orderId], references: [id])
+  orderId String?
+
+  provider    String // "payfast", "peach", ...
+  providerRef String?
   amountCents Int
-  donorEmail String?
+  status      PaymentStatus @default(PENDING)
+  paymentUrl  String?
+  expiresAt   DateTime?
+  paidAt      DateTime?
+
+  tickets Ticket[]
+  resale  Resale?
+  events  PaymentEvent[]
+
   createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([orderId])
+}
+
+// Every webhook/ITN received, so repeated or out-of-order notifications
+// can't double-process a payment.
+model PaymentEvent {
+  id         String   @id @default(cuid())
+  payment    Payment? @relation(fields: [paymentId], references: [id])
+  paymentId  String?
+  provider   String
+  eventId    String // provider's unique id for the notification
+  payload    Json
+  processed  Boolean  @default(false)
+  receivedAt DateTime @default(now())
+
+  @@unique([provider, eventId])
+}
+
+// Audit trail for everything that happens to a ticket (names, resales,
+// check-ins, admin edits). Covers the old free-text transfer column.
+model TicketEvent {
+  id        String          @id @default(cuid())
+  ticket    Ticket          @relation(fields: [ticketId], references: [id])
+  ticketId  String
+  type      TicketEventType
+  actor     String? // "system", "customer", or an admin name
+  data      Json?
+  createdAt DateTime        @default(now())
+
+  @@index([ticketId])
+}
+
+// Everything that costs money: vehicles per departure, dead legs, fees,
+// marketing, hosting. Powers per-departure and per-season margin.
+model CostItem {
+  id          String     @id @default(cuid())
+  season      Season     @relation(fields: [seasonId], references: [id])
+  seasonId    String
+  departure   Departure? @relation(fields: [departureId], references: [id])
+  departureId String?
+  supplier    Supplier?  @relation(fields: [supplierId], references: [id])
+  supplierId  String?
+
+  category    CostCategory
+  description String
+  amountCents Int
+  incurredAt  DateTime?
+  paidAt      DateTime? // null = quoted/owed but not yet paid
+
+  createdAt DateTime @default(now())
+
+  @@index([seasonId])
+  @@index([departureId])
+}
+
+model Donation {
+  id          String   @id @default(cuid())
+  order       Order?   @relation(fields: [orderId], references: [id])
+  orderId     String?
+  amountCents Int
+  donorEmail  String?
+  source      String? // "checkout", "resale_fee", "unused_ticket"
+  createdAt   DateTime @default(now())
 }
